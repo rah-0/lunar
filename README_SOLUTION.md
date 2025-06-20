@@ -89,7 +89,8 @@ Request:
 List all rockets, with optional sorting.
 
 Query Parameters:
-- `sort`: Field to sort by (e.g., `speed`, `-speed` for descending)
+- `sort`: Field to sort by (e.g., `id`, `speed`, `type`, `mission`, `status`)
+- `order`: Sort order (`asc` or `desc`)
 
 #### GET /rockets/{id}
 Get the current state of a specific rocket.
