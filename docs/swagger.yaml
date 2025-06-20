@@ -1,0 +1,177 @@
+definitions:
+  models.Envelope:
+    properties:
+      message:
+        allOf:
+        - $ref: '#/definitions/models.MessageContent'
+        description: Message content with all possible fields
+      metadata:
+        description: Message metadata as a nested structure
+        properties:
+          channel:
+            type: string
+          messageNumber:
+            type: integer
+          messageTime:
+            type: string
+          messageType:
+            type: string
+        type: object
+    type: object
+  models.MessageContent:
+    properties:
+      by:
+        description: RocketSpeedIncreased/RocketSpeedDecreased fields
+        type: integer
+      launchSpeed:
+        type: integer
+      mission:
+        type: string
+      newMission:
+        description: RocketMissionChanged fields
+        type: string
+      reason:
+        description: RocketExploded fields
+        type: string
+      type:
+        description: RocketLaunched fields
+        type: string
+    type: object
+  models.RocketState:
+    properties:
+      createdAt:
+        description: Time when the rocket was first launched
+        type: string
+      exploded:
+        description: Whether the rocket has exploded
+        type: boolean
+      id:
+        description: Same as the channel ID
+        type: string
+      mission:
+        description: Current mission
+        type: string
+      reason:
+        description: Reason for explosion, if applicable
+        type: string
+      speed:
+        description: Current speed
+        type: integer
+      type:
+        description: Type of rocket (e.g., "Falcon-9")
+        type: string
+      updatedAt:
+        description: Last updated time
+        type: string
+    type: object
+  models.RocketSummary:
+    properties:
+      id:
+        type: string
+      mission:
+        type: string
+      speed:
+        type: integer
+      status:
+        type: string
+      type:
+        type: string
+      updatedAt:
+        type: string
+    type: object
+info:
+  contact: {}
+paths:
+  /health:
+    get:
+      description: Returns 200 OK when the service is healthy
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Service status
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Health check
+      tags:
+      - system
+  /messages:
+    post:
+      consumes:
+      - application/json
+      description: Process a rocket message envelope
+      parameters:
+      - description: Message envelope
+        in: body
+        name: message
+        required: true
+        schema:
+          $ref: '#/definitions/models.Envelope'
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Message accepted
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad request
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Process a rocket message
+      tags:
+      - messages
+  /rockets:
+    get:
+      description: Get a list of all rockets, optionally sorted by specified field
+        and order
+      parameters:
+      - description: Sort field (e.g., 'id', 'speed', 'type', 'mission', 'status')
+        in: query
+        name: sort
+        type: string
+      - description: Sort order ('asc' or 'desc')
+        in: query
+        name: order
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: List of rocket summaries
+          schema:
+            items:
+              $ref: '#/definitions/models.RocketSummary'
+            type: array
+      summary: List all rockets
+      tags:
+      - rockets
+  /rockets/{id}:
+    get:
+      description: Retrieve the complete rocket object including all its properties
+      parameters:
+      - description: Rocket ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Complete rocket object
+          schema:
+            $ref: '#/definitions/models.RocketState'
+        "404":
+          description: Rocket not found
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Get rocket by ID
+      tags:
+      - Rockets
+swagger: "2.0"
