@@ -37,12 +37,14 @@ func TestRocketsAcceptsLaunch(t *testing.T) {
 // TestRocketsHelpOutput verifies that the rockets binary provides help output
 func TestRocketsHelpOutput(t *testing.T) {
 	// Try different help flags that might be supported
-	for _, helpFlag := range []string{"--help", "-help", "-h", "help"} {
+	helpFlags := []string{"--help", "-help", "-h", "help"}
+	var lastErr error
+	var lastOutput string
+
+	for _, helpFlag := range helpFlags {
 		cmd := exec.Command("./rockets", helpFlag)
 		output, err := cmd.CombinedOutput()
 		outputStr := string(output)
-
-		t.Logf("Tried 'rockets %s': %v\n%s", helpFlag, err, outputStr)
 
 		// If we got a reasonable amount of output, consider it successful
 		if len(outputStr) > 20 {
@@ -54,11 +56,14 @@ func TestRocketsHelpOutput(t *testing.T) {
 				}
 			}
 		}
+
+		// Save the last error and output in case we need to report it
+		lastErr = err
+		lastOutput = outputStr
 	}
 
 	// If we get here, we tried all help flags and didn't find useful output
-	// This isn't necessarily a failure, but we should note it
-	t.Logf("Could not get helpful output from rockets binary using standard help flags")
+	t.Errorf("Could not get helpful output from rockets binary using standard help flags. Last error: %v, Last output: %s", lastErr, lastOutput)
 }
 
 // TestRocketsVersion verifies the version of the rockets binary

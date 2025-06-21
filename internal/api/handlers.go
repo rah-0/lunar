@@ -68,8 +68,8 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Process the message
-	processed := h.Repository.ProcessMessage(envelope)
+	// Process the message with request context
+	processed := h.Repository.ProcessMessage(r.Context(), envelope)
 
 	// Respond with success status
 	response := map[string]any{
@@ -99,8 +99,8 @@ func (h *Handler) HandleGetRocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Find the rocket
-	rocket, exists := h.Repository.GetRocket(rocketID)
+	// Find the rocket with request context
+	rocket, exists := h.Repository.GetRocket(r.Context(), rocketID)
 	if !exists {
 		respondWithError(w, http.StatusNotFound, fmt.Sprintf("Rocket with ID %s not found", rocketID))
 		return
@@ -124,8 +124,12 @@ func (h *Handler) HandleListRockets(w http.ResponseWriter, r *http.Request) {
 	sortField := r.URL.Query().Get("sort")
 	order := r.URL.Query().Get("order")
 
-	// Get the list of rockets with sort options
-	rockets := h.Repository.ListRockets(sortField, order)
+	// Get the list of rockets with sort options and request context
+	rockets, err := h.Repository.ListRockets(r.Context(), sortField, order)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to list rockets: "+err.Error())
+		return
+	}
 
 	// Return the rocket list
 	respondWithJSON(w, http.StatusOK, rockets)

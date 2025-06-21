@@ -38,7 +38,8 @@ func NewSortOptions() SortOptions {
 }
 
 
-func sortRocketSummaries(summaries []models.RocketSummary, options SortOptions) {
+// SortRocketSummaries sorts the rocket summaries based on the provided options
+func SortRocketSummaries(summaries []models.RocketSummary, options SortOptions) {
 	// Define the sort function based on the field and direction
 	sortFunc := func(i, j int) bool {
 		var result bool

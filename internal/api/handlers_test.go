@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -79,7 +80,7 @@ func TestHandleMessages(t *testing.T) {
 	}
 
 	// Verify the message was processed
-	rocket, exists := repo.GetRocket(rocketID)
+	rocket, exists := repo.GetRocket(context.Background(), rocketID)
 	if !exists {
 		t.Errorf("Expected rocket to be created")
 	} else {
@@ -118,7 +119,7 @@ func TestHandleGetRocket(t *testing.T) {
 	}
 
 	// Process the message to create the rocket
-	repo.ProcessMessage(envelope)
+	repo.ProcessMessage(context.Background(), envelope)
 
 	// Create a test server with all routes registered
 	testServer := setupTestServer(handler)
@@ -184,7 +185,7 @@ func TestHandleListRockets(t *testing.T) {
 				Mission:     "LIST-TEST",
 			},
 		}
-		repo.ProcessMessage(envelope)
+		repo.ProcessMessage(context.Background(), envelope)
 	}
 
 	// Create a test server with all routes registered

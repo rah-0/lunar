@@ -2,23 +2,22 @@ package storage
 
 import (
 	"container/heap"
-	"fmt"
-	"sync"
-	"time"
+	"context"
 
 	"github.com/rah-0/lunar/internal/models"
+	"golang.org/x/sync/semaphore"
 )
 
 // RocketRepository defines the interface for rocket data access
 type RocketRepository interface {
 	// GetRocket retrieves a rocket by its ID
-	GetRocket(id string) (*models.RocketState, bool)
+	GetRocket(ctx context.Context, id string) (*models.RocketState, bool)
 
 	// ListRockets returns all rockets, optionally sorted
-	ListRockets(sortField, order string) []models.RocketSummary
+	ListRockets(ctx context.Context, sortField, order string) ([]models.RocketSummary, error)
 
 	// ProcessMessage processes a rocket message using the Envelope format
-	ProcessMessage(envelope models.Envelope) bool
+	ProcessMessage(ctx context.Context, envelope models.Envelope) bool
 }
 
 // MessageBuffer is a priority queue for out-of-order messages
@@ -45,97 +44,219 @@ func (mb *MessageBuffer) Pop() any {
 	return x
 }
 
-type InMemoryRepository struct {
-	rockets       map[string]*models.RocketState
-	messageBuffer map[string]*MessageBuffer // Message buffer per rocket channel
-	mutex         sync.RWMutex
+// rocketEntry groups together a rocket's state and its message buffer
+type rocketEntry struct {
+	State  *models.RocketState
+	Buffer *MessageBuffer
+	Mu     *ContextMutex // Protects both State and Buffer
 }
 
+// InMemoryRepository is an in-memory implementation of RocketRepository
+type InMemoryRepository struct {
+	mu      *ContextMutex // Protects the rockets map only
+	rockets map[string]*rocketEntry
+}
 
+// NewInMemoryRepository creates a new in-memory repository
 func NewInMemoryRepository() *InMemoryRepository {
 	return &InMemoryRepository{
-		rockets:       make(map[string]*models.RocketState),
-		messageBuffer: make(map[string]*MessageBuffer),
-		mutex:         sync.RWMutex{},
+		mu:      NewContextMutex(),
+		rockets: make(map[string]*rocketEntry),
 	}
 }
 
-func (r *InMemoryRepository) GetRocket(id string) (*models.RocketState, bool) {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
-
-	rocket, exists := r.rockets[id]
-	if !exists {
+func (r *InMemoryRepository) GetRocket(ctx context.Context, id string) (*models.RocketState, bool) {
+	// Check if context is done before acquiring locks
+	if err := ctx.Err(); err != nil {
 		return nil, false
 	}
 
-	// Prevent concurrent modification
-	rocketCopy := *rocket
-	return &rocketCopy, true
+	// Get a read lock on the repository
+	if err := r.mu.Lock(ctx); err != nil {
+		return nil, false
+	}
+
+	entry, exists := r.rockets[id]
+	if !exists {
+		r.mu.Unlock()
+		return nil, false
+	}
+
+	// Get a read lock on the entry
+	if err := entry.Mu.Lock(ctx); err != nil {
+		r.mu.Unlock()
+		return nil, false
+	}
+
+	// Create a deep copy of the state without the mutex
+	rocketCopy := &models.RocketState{
+		ID:                         entry.State.ID,
+		Type:                       entry.State.Type,
+		Speed:                      entry.State.Speed,
+		Mission:                    entry.State.Mission,
+		Exploded:                   entry.State.Exploded,
+		Reason:                     entry.State.Reason,
+		UpdatedAt:                  entry.State.UpdatedAt,
+		CreatedAt:                  entry.State.CreatedAt,
+		LastProcessedMessageNumber: entry.State.LastProcessedMessageNumber,
+	}
+
+	// Unlock in reverse order of locking
+	entry.Mu.Unlock()
+	r.mu.Unlock()
+
+	return rocketCopy, true
 }
 
-func (r *InMemoryRepository) ListRockets(sortField, order string) []models.RocketSummary {
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
+// ContextMutex is a context-aware mutex that can be cancelled
+// It uses semaphore.Weighted under the hood to support context cancellation
+type ContextMutex struct {
+	sem *semaphore.Weighted
+}
 
-	// Create a slice to hold all rocket summaries
+// NewContextMutex creates a new context-aware mutex
+func NewContextMutex() *ContextMutex {
+	return &ContextMutex{
+		sem: semaphore.NewWeighted(1),
+	}
+}
+
+// Lock acquires the lock, blocking until it is available or the context is cancelled
+func (m *ContextMutex) Lock(ctx context.Context) error {
+	return m.sem.Acquire(ctx, 1)
+}
+
+// TryLock attempts to acquire the lock without blocking
+func (m *ContextMutex) TryLock() bool {
+	return m.sem.TryAcquire(1)
+}
+
+// Unlock releases the lock
+func (m *ContextMutex) Unlock() {
+	m.sem.Release(1)
+}
+
+func (r *InMemoryRepository) ListRockets(ctx context.Context, sortField, order string) ([]models.RocketSummary, error) {
+	// Check if context is done before acquiring locks
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Get a read lock on the repository
+	if err := r.mu.Lock(ctx); err != nil {
+		return nil, ctx.Err()
+	}
+	defer r.mu.Unlock()
+
+	// Pre-allocate slice with exact capacity needed
 	summaries := make([]models.RocketSummary, 0, len(r.rockets))
 
-	// Populate the summaries
-	for _, rocket := range r.rockets {
-		status := models.RocketStatusActive
-		if rocket.Exploded {
-			status = models.RocketStatusExploded
+	// Process each entry with its own lock
+	for _, entry := range r.rockets {
+		// Check if context is done before processing each entry
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 
-		summary := models.RocketSummary{
-			ID:        rocket.ID,
-			Type:      rocket.Type,
-			Speed:     rocket.Speed,
-			Mission:   rocket.Mission,
+		// Try to acquire the lock with context
+		if err := entry.Mu.Lock(ctx); err != nil {
+			return nil, ctx.Err()
+		}
+
+		// Process the entry while holding the lock
+		state := entry.State
+		status := "active"
+		if state.Exploded {
+			status = "exploded"
+		}
+
+		summaries = append(summaries, models.RocketSummary{
+			ID:        state.ID,
+			Type:      state.Type,
+			Speed:     state.Speed,
+			Mission:   state.Mission,
 			Status:    status,
-			UpdatedAt: rocket.UpdatedAt,
-		}
+			UpdatedAt: state.UpdatedAt,
+		})
 
-		summaries = append(summaries, summary)
+		// Unlock immediately after processing the entry
+		entry.Mu.Unlock()
 	}
 
-	// Parse sort options and sort the results
-	options := ParseSortOptions(sortField, order)
-	sortRocketSummaries(summaries, options)
+	// Sort the results if needed
+	if sortField != "" {
+		sortRocketSummaries(summaries, sortField, order)
+	}
 
-	return summaries
+	return summaries, nil
 }
 
-// updateRocketState is a helper function that handles the common rocket state update logic
-func (r *InMemoryRepository) updateRocketState(id string, messageTime time.Time, updateFunc func(*models.RocketState) bool, envelope models.Envelope) bool {
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
+// sortRocketSummaries sorts the rocket summaries based on the provided field and order
+func sortRocketSummaries(summaries []models.RocketSummary, field, order string) {
+	options := ParseSortOptions(field, order)
+	// Call the sorting function from sorting.go
+	SortRocketSummaries(summaries, options)
+}
 
-	// Check if rocket exists, create it if it doesn't
-	rocket, exists := r.rockets[id]
-	if !exists {
-		// Create a new rocket state for any message type
-		rocket = &models.RocketState{
-			ID:                         id,
-			Speed:                      0,
-			Exploded:                   false,
-			UpdatedAt:                  messageTime,
-			CreatedAt:                  messageTime,
-			LastProcessedMessageNumber: 0, // Initialize to 0
-		}
-		r.rockets[id] = rocket
+// ProcessMessage processes a rocket message using the Envelope
+func (r *InMemoryRepository) ProcessMessage(ctx context.Context, envelope models.Envelope) bool {
+	// Check if context is done before processing the message
+	if err := ctx.Err(); err != nil {
+		return false
 	}
 
-	// Create message context with all required parameters
-	ctx := MessageContext{
-		ID:         id,
+	// Get the rocket ID from the envelope
+	rocketID := envelope.Metadata.Channel
+
+	// Get a write lock on the repository
+	if err := r.mu.Lock(ctx); err != nil {
+		return false
+	}
+
+	// Get or create the rocket entry
+	entry, exists := r.rockets[rocketID]
+	if !exists {
+		// Create a new rocket state
+		state := &models.RocketState{
+			ID:       rocketID,
+			Type:     envelope.Message.Type,
+			Mission:  "",
+			Speed:    0,
+			Exploded: false,
+		}
+
+		// Create a new message buffer
+		buffer := &MessageBuffer{}
+		heap.Init(buffer)
+
+		// Create a new entry with a new context mutex
+		entry = &rocketEntry{
+			State:  state,
+			Buffer: buffer,
+			Mu:     NewContextMutex(),
+		}
+		r.rockets[rocketID] = entry
+	}
+
+	// We can unlock the repository mutex now that we have the entry
+	r.mu.Unlock()
+
+	// Get the update function for this message type
+	updateFunc := r.getUpdateFuncForMessage(envelope)
+	if updateFunc == nil {
+		return false
+	}
+
+	// Process the message with proper ordering
+	msgCtx := MessageContext{
+		ID:         rocketID,
 		Envelope:   envelope,
 		UpdateFunc: updateFunc,
+		Ctx:        ctx, // Pass through the original context
 	}
 
-	// Process messages in correct order using buffering
-	return r.processMessageWithOrdering(rocket, ctx)
+	// Process the message with ordering
+	return r.processMessageWithOrdering(entry, msgCtx)
 }
 
 // MessageContext groups related message processing parameters
@@ -143,253 +264,172 @@ type MessageContext struct {
 	ID         string
 	Envelope   models.Envelope
 	UpdateFunc func(*models.RocketState) bool
+	Ctx        context.Context // Original context from the request
 }
 
 // processMessageWithOrdering processes messages in correct sequence using buffering
-func (r *InMemoryRepository) processMessageWithOrdering(rocket *models.RocketState, ctx MessageContext) bool {
-	// Case 1: Message is a duplicate (already processed)
-	if ctx.Envelope.GetMessageNumber() <= rocket.LastProcessedMessageNumber {
-		// Log duplicate message
-		fmt.Printf("Discarded duplicate message: channel=%s, messageNumber=%d, current=%d\n",
-			ctx.ID, ctx.Envelope.GetMessageNumber(), rocket.LastProcessedMessageNumber)
+func (r *InMemoryRepository) processMessageWithOrdering(entry *rocketEntry, ctx MessageContext) bool {
+	// Lock the entry for the duration of processing
+	if err := entry.Mu.Lock(ctx.Ctx); err != nil {
+		return false
+	}
+	defer entry.Mu.Unlock()
+
+	rocket := entry.State
+	msgNum := ctx.Envelope.GetMessageNumber()
+
+	// If rocket has exploded, only allow relaunch messages
+	if rocket.Exploded && ctx.Envelope.GetMessageType() != models.MessageTypeRocketLaunched {
 		return false
 	}
 
-	// Case 2: This is the next expected message (can be applied immediately)
-	expectedMsgNumber := rocket.LastProcessedMessageNumber + 1
-	if ctx.Envelope.GetMessageNumber() == expectedMsgNumber {
-		// Skip further processing if the rocket has exploded (except for relaunch)
-		if rocket.Exploded && ctx.Envelope.GetMessageType() != models.MessageTypeRocketLaunched {
-			// If rocket is exploded and this isn't a relaunch, clean up any buffered messages
-			// to save memory - no point keeping them if they won't be applied
-			r.cleanupBufferForExplodedRocket(ctx.ID)
+	// Check if this is a duplicate or old message
+	if msgNum <= rocket.LastProcessedMessageNumber {
+		return false
+	}
+
+	// Check if this is the next expected message
+	expectedMsgNum := rocket.LastProcessedMessageNumber + 1
+
+	// If this is the next expected message, process it immediately
+	if msgNum == expectedMsgNum {
+		// Apply the update
+		if !ctx.UpdateFunc(rocket) {
 			return false
 		}
+		rocket.LastProcessedMessageNumber = msgNum
+		rocket.UpdatedAt = ctx.Envelope.GetMessageTime()
 
-		// Apply this message
-		processed := ctx.UpdateFunc(rocket)
-		if processed {
-			// Update metadata
-			rocket.LastProcessedMessageNumber = ctx.Envelope.GetMessageNumber()
-			rocket.UpdatedAt = ctx.Envelope.GetMessageTime()
-
-			// Check if the rocket exploded from this message
-			if rocket.Exploded {
-				// If the rocket just exploded, clean up buffered messages to save memory
-				r.cleanupBufferForExplodedRocket(ctx.ID)
-			} else {
-				// Process any buffered messages that might now be applicable
-				r.processBufferedMessages(ctx.ID, rocket)
-			}
+		// If rocket exploded, clean up its buffer
+		if rocket.Exploded {
+			entry.Buffer = &MessageBuffer{} // Clear the buffer
+			heap.Init(entry.Buffer)         // Initialize the new buffer
+			return true
 		}
-		return processed
+
+		// Process any buffered messages that can now be applied
+		r.processBufferedMessages(entry)
+		return true
 	}
 
-	// Case 3: Message is from the future (buffer it for later processing)
-
-	// Only buffer the message if the rocket is not exploded (to save memory)
-	// Exception: If this is a relaunch message, we should buffer it
-	if !rocket.Exploded || ctx.Envelope.GetMessageType() == models.MessageTypeRocketLaunched {
-		return r.bufferMessage(ctx.ID, rocket, ctx.Envelope)
-	}
-	// Rocket is exploded and this isn't a relaunch, no need to buffer
-	fmt.Printf("Skipped buffering message for exploded rocket: channel=%s, messageNumber=%d\n",
-		ctx.ID, ctx.Envelope.GetMessageNumber())
-	return false
+	// If we get here, the message is out of order and needs to be buffered
+	return r.bufferMessage(entry, ctx.Envelope)
 }
 
-func (r *InMemoryRepository) bufferMessage(id string, rocket *models.RocketState, envelope models.Envelope) bool {
-
-	// Initialize buffer for this channel if it doesn't exist
-	buffer, exists := r.messageBuffer[id]
-	if !exists {
-		buffer = &MessageBuffer{}
-		heap.Init(buffer)
-		r.messageBuffer[id] = buffer
-	}
-
-	// Add the message to the priority queue (sorted by message number)
-	heap.Push(buffer, &envelope)
-
-	// Log buffered message
-	fmt.Printf("Buffered out-of-order message: channel=%s, messageNumber=%d, expected=%d\n",
-		id, envelope.GetMessageNumber(), rocket.LastProcessedMessageNumber+1)
-
-	return true // Message was accepted (buffered)
+// bufferMessage adds a message to the buffer in a thread-safe way
+func (r *InMemoryRepository) bufferMessage(entry *rocketEntry, envelope models.Envelope) bool {
+	// Create a copy of the envelope to avoid data races
+	envCopy := envelope
+	heap.Push(entry.Buffer, &envCopy)
+	return true
 }
 
-// processBufferedMessages attempts to process any buffered messages that can now be applied
-func (r *InMemoryRepository) processBufferedMessages(id string, rocket *models.RocketState) {
-	// Get the message buffer for this rocket
-	buffer, exists := r.messageBuffer[id]
-	if !exists || buffer.Len() == 0 {
-		return // No buffered messages
-	}
+// processBufferedMessages processes any buffered messages that can now be applied
+// in the correct order. It processes messages in sequence starting from the next
+// expected message number.
+func (r *InMemoryRepository) processBufferedMessages(entry *rocketEntry) {
+	rocket := entry.State
+	buffer := entry.Buffer
 
-	// Process messages in order
-	processed := true
-	for processed && buffer.Len() > 0 {
-		// Peek at the next message (don't remove it yet)
+	for buffer.Len() > 0 {
+		// Peek at the next message without removing it
 		nextMsg := (*buffer)[0]
+		expectedMsgNum := rocket.LastProcessedMessageNumber + 1
 
 		// If the next message is not the one we expect, stop processing
-		if nextMsg.GetMessageNumber() != rocket.LastProcessedMessageNumber+1 {
+		if nextMsg.GetMessageNumber() != expectedMsgNum {
 			break
 		}
 
-		// Pop the message from the buffer
-		msg := heap.Pop(buffer).(*models.Envelope)
-
-		// Apply the message to the rocket state
-		processed = r.applyMessage(rocket, msg)
-
-		if processed {
-			// Update metadata
-			rocket.LastProcessedMessageNumber = msg.GetMessageNumber()
-			rocket.UpdatedAt = msg.GetMessageTime()
-
-			// Log applied message
-			fmt.Printf("Applied buffered message: channel=%s, messageNumber=%d\n", id, msg.GetMessageNumber())
-
-			// If rocket exploded from a buffered message, stop processing and clean up remaining buffer
-			if rocket.Exploded {
-				r.cleanupBufferForExplodedRocket(id)
-				break
-			}
+		// Get the update function for this message type
+		updateFunc := r.getUpdateFuncForMessage(*nextMsg)
+		if updateFunc == nil {
+			// Remove the message we can't process
+			heap.Pop(buffer)
+			continue
 		}
-	}
 
-	// Clean up empty buffer
-	if buffer.Len() == 0 {
-		delete(r.messageBuffer, id)
+		// Apply the update
+		if !updateFunc(rocket) {
+			// If the update fails, remove the message and continue
+			heap.Pop(buffer)
+			continue
+		}
+
+		// Update the last processed message number
+		rocket.LastProcessedMessageNumber = expectedMsgNum
+		rocket.UpdatedAt = nextMsg.GetMessageTime()
+
+		// Remove the processed message from the buffer
+		heap.Pop(buffer)
+
+		// If the rocket exploded, clear the buffer and stop processing
+		if rocket.Exploded {
+			entry.Buffer = &MessageBuffer{}
+			heap.Init(entry.Buffer) // Initialize the new buffer
+			break
+		}
 	}
 }
 
-// cleanupBufferForExplodedRocket removes all buffered messages for an exploded rocket
-// to free up memory - once a rocket has exploded, we don't need to process most messages
-// (except potential future relaunch messages)
-func (r *InMemoryRepository) cleanupBufferForExplodedRocket(id string) {
-	buffer, exists := r.messageBuffer[id]
-	if !exists || buffer.Len() == 0 {
-		return // No buffered messages to clean up
-	}
-
-	// Keep only future relaunch messages (if any)
-	preservedMessages := &MessageBuffer{}
-	heap.Init(preservedMessages)
-
-	for buffer.Len() > 0 {
-		msg := heap.Pop(buffer).(*models.Envelope)
-
-		// Preserve only relaunch messages
-		if msg.GetMessageType() == models.MessageTypeRocketLaunched {
-			heap.Push(preservedMessages, msg)
-		} else {
-			fmt.Printf("Discarded buffered message for exploded rocket: channel=%s, messageNumber=%d\n",
-				id, msg.GetMessageNumber())
-		}
-	}
-
-	// If we saved any messages, update the buffer, otherwise remove it
-	if preservedMessages.Len() > 0 {
-		r.messageBuffer[id] = preservedMessages
-		fmt.Printf("Kept %d relaunch messages in buffer for exploded rocket: channel=%s\n",
-			preservedMessages.Len(), id)
-	} else {
-		delete(r.messageBuffer, id)
-		fmt.Printf("Removed entire message buffer for exploded rocket: channel=%s\n", id)
-	}
-}
-
-func (r *InMemoryRepository) applyMessage(rocket *models.RocketState, msg *models.Envelope) bool {
-	// Ensure we have the message content before applying
-	if msg == nil {
-		fmt.Printf("Error: Attempted to apply nil message\n")
-		return false
-	}
-
+// getUpdateFuncForMessage returns the appropriate update function for a message type
+func (r *InMemoryRepository) getUpdateFuncForMessage(msg models.Envelope) func(*models.RocketState) bool {
 	switch msg.GetMessageType() {
 	case models.MessageTypeRocketLaunched:
-		// Verify we have the necessary message content
-		if msg.Message.Type == "" || msg.Message.Mission == "" {
-			fmt.Printf("Warning: Incomplete launch message content: type=%s, mission=%s\n",
-				msg.Message.Type, msg.Message.Mission)
+		return func(rocket *models.RocketState) bool {
+			if msg.Message.Type == "" || msg.Message.Mission == "" {
+				return false
+			}
+			rocket.Type = msg.Message.Type
+			rocket.Mission = msg.Message.Mission
+			rocket.Speed = msg.Message.LaunchSpeed
+			rocket.CreatedAt = msg.GetMessageTime()
+			rocket.Exploded = false
+			rocket.Reason = ""
+			return true
 		}
-
-		rocket.Type = msg.Message.Type
-		rocket.Mission = msg.Message.Mission
-		rocket.Speed = msg.Message.LaunchSpeed
-		rocket.CreatedAt = msg.GetMessageTime()
-		rocket.Exploded = false
-		rocket.Reason = ""
-		return true
 
 	case models.MessageTypeRocketSpeedIncreased:
-		rocket.Speed += msg.Message.By
-		return true
+		return func(rocket *models.RocketState) bool {
+			if msg.Message.By <= 0 {
+				return false
+			}
+			rocket.Speed += msg.Message.By
+			return true
+		}
 
 	case models.MessageTypeRocketSpeedDecreased:
-		rocket.Speed -= msg.Message.By
-		if rocket.Speed < 0 {
-			rocket.Speed = 0
+		return func(rocket *models.RocketState) bool {
+			if msg.Message.By <= 0 {
+				return false
+			}
+			rocket.Speed -= msg.Message.By
+			if rocket.Speed < 0 {
+				rocket.Speed = 0
+			}
+			return true
 		}
-		return true
 
 	case models.MessageTypeRocketExploded:
-		rocket.Exploded = true
-		rocket.Reason = msg.Message.Reason
-		return true
+		return func(rocket *models.RocketState) bool {
+			if msg.Message.Reason == "" {
+				return false
+			}
+			rocket.Exploded = true
+			rocket.Reason = msg.Message.Reason
+			return true
+		}
 
 	case models.MessageTypeRocketMissionChanged:
-		rocket.Mission = msg.Message.NewMission
-		return true
+		return func(rocket *models.RocketState) bool {
+			if msg.Message.NewMission == "" {
+				return false
+			}
+			rocket.Mission = msg.Message.NewMission
+			return true
+		}
 
 	default:
-		return false // Unknown message type
+		return nil // Unknown message type
 	}
-}
-// ProcessMessage processes a rocket message using the Envelope
-func (r *InMemoryRepository) ProcessMessage(envelope models.Envelope) bool {
-	// Process the message passing the original envelope through for potential buffering
-	return r.updateRocketState(
-		envelope.GetChannel(),
-		envelope.GetMessageTime(),
-		func(rocket *models.RocketState) bool {
-			// Process message based on its type
-			switch envelope.GetMessageType() {
-			case models.MessageTypeRocketLaunched:
-				rocket.Type = envelope.Message.Type
-				rocket.Mission = envelope.Message.Mission
-				rocket.Speed = envelope.Message.LaunchSpeed
-				rocket.CreatedAt = envelope.GetMessageTime()
-				rocket.Exploded = false
-				rocket.Reason = ""
-				return true
-
-			case models.MessageTypeRocketSpeedIncreased:
-				rocket.Speed += envelope.Message.By
-				return true
-
-			case models.MessageTypeRocketSpeedDecreased:
-				rocket.Speed -= envelope.Message.By
-				if rocket.Speed < 0 {
-					rocket.Speed = 0
-				}
-				return true
-
-			case models.MessageTypeRocketExploded:
-				rocket.Exploded = true
-				rocket.Reason = envelope.Message.Reason
-				return true
-
-			case models.MessageTypeRocketMissionChanged:
-				rocket.Mission = envelope.Message.NewMission
-				return true
-
-			default:
-				return false // Unknown message type
-			}
-		},
-		envelope,
-	)
 }

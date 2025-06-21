@@ -51,7 +51,7 @@ func TestSortRocketSummaries(t *testing.T) {
 
 			// Apply sorting
 			options := ParseSortOptions(tc.sortField, tc.order)
-			sortRocketSummaries(summariesCopy, options)
+			SortRocketSummaries(summariesCopy, options)
 
 			// Verify the order
 			assert.Equal(t, tc.expectedFirst, summariesCopy[0].ID)

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -20,7 +21,7 @@ func TestProcessMessageOutOfOrder(t *testing.T) {
 	speedIncreaseMsg := createSpeedIncreaseMessage(rocketID, 2, launchTime.Add(1*time.Second), 1000)
 
 	// Process message 2 first (out of order)
-	processed := repo.ProcessMessage(speedIncreaseMsg)
+	processed := repo.ProcessMessage(context.Background(), speedIncreaseMsg)
 
 	// Should be accepted and buffered
 	if !processed {
@@ -28,7 +29,7 @@ func TestProcessMessageOutOfOrder(t *testing.T) {
 	}
 
 	// Verify rocket was created but speed is NOT increased yet (message is buffered)
-	rocket, exists := repo.GetRocket(rocketID)
+	rocket, exists := repo.GetRocket(context.Background(), rocketID)
 	if !exists {
 		t.Errorf("Expected rocket to exist after processing speed increase message")
 		return
@@ -41,7 +42,7 @@ func TestProcessMessageOutOfOrder(t *testing.T) {
 
 	// Now send message 1 - should be processed and then message 2 should be applied from the buffer
 	launchMsg := createLaunchMessage(rocketID, 1, launchTime, "Falcon-9", 500, "TEST-MISSION")
-	processed = repo.ProcessMessage(launchMsg)
+	processed = repo.ProcessMessage(context.Background(), launchMsg)
 
 	// Should be processed
 	if !processed {
@@ -49,7 +50,7 @@ func TestProcessMessageOutOfOrder(t *testing.T) {
 	}
 
 	// Verify rocket state is updated from BOTH messages (message 1 and then buffered message 2)
-	rocket, _ = repo.GetRocket(rocketID)
+	rocket, _ = repo.GetRocket(context.Background(), rocketID)
 
 	// Check that message 1 was applied (launched rocket)
 	if rocket.Type != "Falcon-9" {
@@ -68,7 +69,7 @@ func TestProcessMessageOutOfOrder(t *testing.T) {
 
 	// Now try to process a duplicate message (same number as already processed)
 	duplicateMsg := createLaunchMessage(rocketID, 1, launchTime, "Duplicate-Rocket", 999, "DUPLICATE")
-	processed = repo.ProcessMessage(duplicateMsg)
+	processed = repo.ProcessMessage(context.Background(), duplicateMsg)
 
 	// Should be ignored as a duplicate
 	if processed {
@@ -76,7 +77,7 @@ func TestProcessMessageOutOfOrder(t *testing.T) {
 	}
 
 	// Verify rocket state was not changed by duplicate message
-	rocket, _ = repo.GetRocket(rocketID)
+	rocket, _ = repo.GetRocket(context.Background(), rocketID)
 	if rocket.Mission == "DUPLICATE" {
 		t.Errorf("Duplicate message incorrectly modified rocket state")
 	}
@@ -93,45 +94,45 @@ func TestProcessDuplicateMessages(t *testing.T) {
 	launchMsg := createLaunchMessage(rocketID, 1, launchTime, "Falcon-Heavy", 700, "DUPLICATE-TEST")
 
 	// Process original message
-	processed := repo.ProcessMessage(launchMsg)
+	processed := repo.ProcessMessage(context.Background(), launchMsg)
 	if !processed {
 		t.Errorf("Expected launch message to be processed, but it was rejected")
 	}
 
 	// Verify initial state
-	_, exists := repo.GetRocket(rocketID)
+	_, exists := repo.GetRocket(context.Background(), rocketID)
 	if !exists {
 		t.Errorf("Expected rocket to exist after processing launch message")
 		return
 	}
 
 	// Try to process the same message again
-	processed = repo.ProcessMessage(launchMsg)
+	processed = repo.ProcessMessage(context.Background(), launchMsg)
 	if processed {
 		t.Errorf("Expected duplicate message to be rejected, but it was processed")
 	}
 
 	// Verify rocket state hasn't changed
-	rocketState, _ := repo.GetRocket(rocketID)
+	rocketState, _ := repo.GetRocket(context.Background(), rocketID)
 	if rocketState.Speed != 700 {
 		t.Errorf("Expected rocket speed to remain 700, got %d", rocketState.Speed)
 	}
 
 	// Process new message with higher message number
 	speedIncreaseMsg := createSpeedIncreaseMessage(rocketID, 2, launchTime.Add(1*time.Second), 300)
-	processed = repo.ProcessMessage(speedIncreaseMsg)
+	processed = repo.ProcessMessage(context.Background(), speedIncreaseMsg)
 	if !processed {
 		t.Errorf("Expected speed increase message to be processed, but it was rejected")
 	}
 
 	// Verify rocket state updated
-	rocketState, _ = repo.GetRocket(rocketID)
+	rocketState, _ = repo.GetRocket(context.Background(), rocketID)
 	if rocketState.Speed != 1000 { // 700 + 300
 		t.Errorf("Expected rocket speed to be 1000, got %d", rocketState.Speed)
 	}
 
 	// Try to process a duplicate of the second message
-	processed = repo.ProcessMessage(speedIncreaseMsg)
+	processed = repo.ProcessMessage(context.Background(), speedIncreaseMsg)
 	if processed {
 		t.Errorf("Expected duplicate speed increase message to be rejected, but it was processed")
 	}
@@ -146,18 +147,18 @@ func TestRocketLifecycle(t *testing.T) {
 
 	// Launch rocket
 	launchMsg := createLaunchMessage(rocketID, 1, launchTime, "Falcon-9", 500, "LIFECYCLE-TEST")
-	repo.ProcessMessage(launchMsg)
+	repo.ProcessMessage(context.Background(), launchMsg)
 
 	// Increase speed
 	speedIncreaseMsg := createSpeedIncreaseMessage(rocketID, 2, launchTime.Add(1*time.Second), 500)
-	repo.ProcessMessage(speedIncreaseMsg)
+	repo.ProcessMessage(context.Background(), speedIncreaseMsg)
 
 	// Change mission
 	missionChangeMsg := createMissionChangeMessage(rocketID, 3, launchTime.Add(2*time.Second), "NEW-MISSION")
-	repo.ProcessMessage(missionChangeMsg)
+	repo.ProcessMessage(context.Background(), missionChangeMsg)
 
 	// Check state
-	rocket, exists := repo.GetRocket(rocketID)
+	rocket, exists := repo.GetRocket(context.Background(), rocketID)
 	if !exists {
 		t.Errorf("Expected rocket to exist")
 		return
@@ -169,24 +170,32 @@ func TestRocketLifecycle(t *testing.T) {
 
 	// Explode rocket
 	explodeMsg := createExplodeMessage(rocketID, 4, launchTime.Add(3*time.Second), "ENGINE_FAILURE")
-	repo.ProcessMessage(explodeMsg)
+	processed := repo.ProcessMessage(context.Background(), explodeMsg)
+	if !processed {
+		t.Error("Expected explosion message to be processed, but it was rejected")
+	}
 
 	// Check state
-	rocket, _ = repo.GetRocket(rocketID)
+	rocket, found := repo.GetRocket(context.Background(), rocketID)
+	if !found {
+		t.Fatal("Rocket not found after explosion message")
+	}
+
 	if !rocket.Exploded || rocket.Reason != "ENGINE_FAILURE" {
-		t.Errorf("Expected rocket to be exploded with reason ENGINE_FAILURE")
+		t.Errorf("Expected rocket to be exploded with reason ENGINE_FAILURE, got exploded=%v, reason=%q, lastMsgNum=%d",
+			rocket.Exploded, rocket.Reason, rocket.LastProcessedMessageNumber)
 	}
 
 	// Try to increase speed after explosion (should be rejected)
 	finalSpeedMsg := createSpeedIncreaseMessage(rocketID, 5, launchTime.Add(4*time.Second), 200)
-	processed := repo.ProcessMessage(finalSpeedMsg)
+	speedProcessed := repo.ProcessMessage(context.Background(), finalSpeedMsg)
 
-	if processed {
+	if speedProcessed {
 		t.Errorf("Expected message to be rejected after explosion")
 	}
 
 	// Check final state
-	rocket, _ = repo.GetRocket(rocketID)
+	rocket, _ = repo.GetRocket(context.Background(), rocketID)
 	if rocket.Speed != 1000 { // Should remain unchanged
 		t.Errorf("Expected rocket speed to remain 1000 after explosion, got %d", rocket.Speed)
 	}
@@ -243,5 +252,3 @@ func createExplodeMessage(rocketID string, msgNum int, msgTime time.Time, reason
 	}
 	return env
 }
-
-// Removed unused function createSpeedDecreaseMessage
